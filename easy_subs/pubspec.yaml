@@ -11,6 +11,8 @@ dependencies:
   flutter:
     sdk: flutter
   in_app_purchase: ^3.2.3
+  in_app_purchase_storekit: ^0.4.8
+  url_launcher: ^6.3.0
 
 dev_dependencies:
   flutter_test:

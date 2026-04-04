@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:in_app_purchase_storekit/in_app_purchase_storekit.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../domain/models/subscription_plan.dart';
 import '../domain/models/purchase_result.dart' as easy;
 import '../domain/repositories/subscription_repository.dart';
@@ -11,6 +13,24 @@ class IAPService implements SubscriptionRepository {
   // Internal cache to map back to native in_app_purchase objects
   final Map<String, ProductDetails> _cachedProducts = {};
   final Map<String, PurchaseDetails> _cachedPurchases = {};
+
+  bool _isStoreKitNoResponse(Object error) {
+    final value = error.toString();
+    return value.contains('storekit_no_response') || value.contains('StoreKit: Failed to get response from platform');
+  }
+
+  Future<void> _attemptStoreKitRecovery() async {
+    if (!Platform.isIOS) return;
+
+    try {
+      final InAppPurchaseStoreKitPlatformAddition iosAddition = _iap.getPlatformAddition<InAppPurchaseStoreKitPlatformAddition>();
+      await iosAddition.sync();
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      print('[easy_subs][iap] recovery sync completed');
+    } catch (e) {
+      print('[easy_subs][iap] recovery sync failed: $e');
+    }
+  }
 
   bool _looksLikeJws(String value) {
     return value.isNotEmpty && value.split('.').length == 3;
@@ -105,7 +125,25 @@ class IAPService implements SubscriptionRepository {
   @override
   Future<List<SubscriptionPlan>> getAvailablePlans(Set<String> productIds) async {
     print('[easy_subs][iap] getAvailablePlans start productIds=${productIds.toList()}');
-    final ProductDetailsResponse response = await _iap.queryProductDetails(productIds);
+
+    ProductDetailsResponse response;
+    try {
+      response = await _iap.queryProductDetails(productIds);
+    } catch (e) {
+      if (Platform.isIOS && _isStoreKitNoResponse(e)) {
+        print('[easy_subs][iap] getAvailablePlans no_response on first query, attempting sync + retry');
+        await _attemptStoreKitRecovery();
+        response = await _iap.queryProductDetails(productIds);
+      } else {
+        rethrow;
+      }
+    }
+
+    if (response.error != null && Platform.isIOS && _isStoreKitNoResponse(response.error!)) {
+      print('[easy_subs][iap] getAvailablePlans no_response in response payload, attempting sync + retry');
+      await _attemptStoreKitRecovery();
+      response = await _iap.queryProductDetails(productIds);
+    }
 
     if (response.error != null) {
       print('[easy_subs][iap] getAvailablePlans error code=${response.error?.code} message=${response.error?.message}');
@@ -176,6 +214,26 @@ class IAPService implements SubscriptionRepository {
       }
     } else {
       print('[easy_subs][iap] completePurchase skipped pendingComplete=${pd.pendingCompletePurchase} purchaseId=${purchase.purchaseId}');
+    }
+  }
+
+  @override
+  Future<void> presentCodeRedemptionSheet({String? code}) async {
+    print('[easy_subs][iap] presentCodeRedemptionSheet start code=$code');
+    if (Platform.isIOS) {
+      final InAppPurchaseStoreKitPlatformAddition iosAddition = _iap.getPlatformAddition<InAppPurchaseStoreKitPlatformAddition>();
+      await iosAddition.presentCodeRedemptionSheet();
+    } else if (Platform.isAndroid) {
+      // In Android, there's no native overlay, so we redirect the user to Play Store
+      final urlStr = code != null && code.isNotEmpty ? 'https://play.google.com/redeem?code=$code' : 'https://play.google.com/redeem';
+      final uri = Uri.parse(urlStr);
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      } else {
+        throw Exception('Could not launch Android redeem URL.');
+      }
+    } else {
+      throw UnsupportedError('Promo codes are only supported on iOS and Android.');
     }
   }
 }
