@@ -218,6 +218,27 @@ class IAPService implements SubscriptionRepository {
   }
 
   @override
+  Future<void> openManageSubscription() async {
+    print('[easy_subs][iap] openManageSubscription start platform=${Platform.operatingSystem}');
+
+    final Uri uri;
+    if (Platform.isIOS || Platform.isMacOS) {
+      uri = Uri.parse('https://apps.apple.com/account/subscriptions');
+    } else if (Platform.isAndroid) {
+      uri = Uri.parse('https://play.google.com/store/account/subscriptions');
+    } else {
+      throw UnsupportedError('Subscription management is only supported on iOS, macOS, and Android.');
+    }
+
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      print('[easy_subs][iap] openManageSubscription launched uri=$uri');
+    } else {
+      throw Exception('Could not open subscription management.');
+    }
+  }
+
+  @override
   Future<void> presentCodeRedemptionSheet({String? code}) async {
     print('[easy_subs][iap] presentCodeRedemptionSheet start code=$code');
     if (Platform.isIOS) {

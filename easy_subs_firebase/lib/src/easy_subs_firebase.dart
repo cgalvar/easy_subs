@@ -10,6 +10,35 @@ class EasySubsFirebase {
   final FirebaseAuth auth;
   final String verifyPurchaseFunctionName;
 
+  bool _isEntitledStatus(String? status) => status == 'active' || status == 'trialing';
+
+  String _buildVerificationMessage({required String source, required Map<String, dynamic> details, required String fallback}) {
+    final status = details['status']?.toString().toLowerCase();
+    final appleEnvironment = details['appleEnvironment']?.toString().toLowerCase();
+    final transactionReason = details['transactionReason']?.toString().toUpperCase();
+
+    if (source == 'app_store' && status == 'expired' && appleEnvironment == 'sandbox') {
+      if (transactionReason == 'RENEWAL') {
+        return 'Sandbox returned an expired renewal transaction from previous test history. Please clear Sandbox purchase history or use a fresh Sandbox tester account and try again.';
+      }
+      return 'The Sandbox subscription is expired. This can happen quickly in test mode. Try purchasing again.';
+    }
+
+    if (status == 'expired') {
+      return 'This subscription is expired. Please renew in the store or restore purchases.';
+    }
+
+    if (status == 'revoked') {
+      return 'This purchase was revoked by the store and is no longer valid.';
+    }
+
+    if (status == 'refunded') {
+      return 'This purchase was refunded by the store and is no longer valid.';
+    }
+
+    return fallback;
+  }
+
   EasySubsFirebase({
     required this.functions,
     required this.firestore,
@@ -86,20 +115,41 @@ class EasySubsFirebase {
 
       debugPrint('[easy_subs_firebase] verifyPurchase callable response type=${result.data.runtimeType} data=$result');
 
-      if (result.data['success'] == true) {
+      final response = result.data is Map ? Map<String, dynamic>.from(result.data as Map) : <String, dynamic>{};
+      final details = response['details'] is Map ? Map<String, dynamic>.from(response['details'] as Map) : <String, dynamic>{};
+      final status = details['status']?.toString().toLowerCase();
+
+      if (response['success'] == true) {
+        // Defensive fallback in case backend returns success for a non-entitled status.
+        if (status != null && status.isNotEmpty && !_isEntitledStatus(status)) {
+          final message = _buildVerificationMessage(
+            source: source,
+            details: details,
+            fallback: response['message']?.toString() ?? 'Receipt validation returned a non-entitled status.',
+          );
+          debugPrint('[easy_subs_firebase] verifyPurchase inconsistent success status=$status message=$message details=$details');
+          throw Exception(message);
+        }
+
         debugPrint('[easy_subs_firebase] verifyPurchase success source=$source productId=$productId');
         return true;
       }
 
-      final message = result.data['message']?.toString() ?? 'Receipt validation failed remotely.';
-      debugPrint('[easy_subs_firebase] verifyPurchase remote failure message=$message details=${result.data['details']}');
+      final message = _buildVerificationMessage(
+        source: source,
+        details: details,
+        fallback: response['message']?.toString() ?? 'Receipt validation failed remotely.',
+      );
+      debugPrint('[easy_subs_firebase] verifyPurchase remote failure message=$message details=${response['details']}');
       throw Exception(message);
     } on FirebaseFunctionsException catch (e) {
       debugPrint('EasySubsFirebase - Function Error: ${e.code} - ${e.message}');
       throw Exception(e.message ?? 'Unknown Firebase Error');
     } catch (e) {
       debugPrint('EasySubsFirebase - Unknown Error interpreting receipt: $e');
-      // Keep the original reason to simplify troubleshooting (e.g. Apple 21002/21004).
+      if (e is Exception) {
+        rethrow;
+      }
       throw Exception(e.toString());
     }
   }

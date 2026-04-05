@@ -23,6 +23,10 @@ abstract class SubscriptionRepository {
   /// after your backend successfully validates the `verificationToken`.
   Future<void> completePurchase(PurchaseResult purchase);
 
+  /// Opens the platform's subscription management screen so users can cancel
+  /// or update their subscription directly in the store.
+  Future<void> openManageSubscription();
+
   /// Presents the store's code redemption sheet (iOS) or redirects to Play Store (Android)
   Future<void> presentCodeRedemptionSheet({String? code});
 }

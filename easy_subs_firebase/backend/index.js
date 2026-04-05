@@ -74,6 +74,10 @@ function mapAppleWebhookStatus(notificationType, subtype) {
   }
 }
 
+function isEntitledStatus(status) {
+  return status === "active" || status === "trialing";
+}
+
 async function upsertSubscription(adminInstance, userId, data) {
   console.log("[easySubs][subscriptions] upsert start", {
     userId,
@@ -235,12 +239,17 @@ function parseAppleSignedTransactionInfo(signedTransactionInfo) {
   const expiryDateMs = toMillis(tx.expiresDate);
   const now = Date.now();
   const isExpired = expiryDateMs ? expiryDateMs <= now : false;
+  const hasTransaction = Boolean(tx.transactionId || tx.originalTransactionId);
+  const status = !hasTransaction
+    ? "unknown"
+    : tx.revocationDate
+      ? "revoked"
+      : (expiryDateMs && isExpired ? "expired" : "active");
 
   return {
-    isValid: Boolean(tx.transactionId || tx.originalTransactionId),
-    status: tx.revocationDate
-      ? "revoked"
-      : (expiryDateMs && isExpired ? "expired" : "active"),
+    hasTransaction,
+    isValid: hasTransaction && isEntitledStatus(status),
+    status,
     originalTransactionId: tx.originalTransactionId || null,
     transactionId: tx.transactionId || null,
     purchaseDateMs: toMillis(tx.purchaseDate),
@@ -350,7 +359,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
   if (!payload) {
     const productMatches = !productId || !parsedFromSignedTransaction.productId || parsedFromSignedTransaction.productId === productId;
 
-    if (isAppleTransactionNotFoundError(lastError) && parsedFromSignedTransaction.isValid && productMatches) {
+    if (isAppleTransactionNotFoundError(lastError) && parsedFromSignedTransaction.hasTransaction && productMatches) {
       console.warn("[easySubs][verifyPurchase] Apple transaction not found in Server API", {
         transactionId,
         productId,
@@ -418,10 +427,13 @@ function parseAppleReceiptResult(payload) {
   const expiryDateMs = toMillis(tx?.expires_date_ms);
   const now = Date.now();
   const isExpired = expiryDateMs ? expiryDateMs <= now : false;
+  const hasTransaction = Boolean(tx);
+  const status = hasTransaction ? (isExpired ? "expired" : "active") : "unknown";
 
   return {
-    isValid: Boolean(tx),
-    status: tx ? (isExpired ? "expired" : "active") : "unknown",
+    hasTransaction,
+    isValid: hasTransaction && isEntitledStatus(status),
+    status,
     originalTransactionId: tx?.original_transaction_id || null,
     transactionId: tx?.transaction_id || null,
     purchaseDateMs: toMillis(tx?.purchase_date_ms),
@@ -600,7 +612,11 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
 
         console.log("[easySubs][verifyPurchase] success", { requestId, userId, planId: productId });
 
-        return { success: true, message: "Purchase verified successfully." };
+        return {
+          success: true,
+          message: "Purchase verified successfully.",
+          details: verification.details || {},
+        };
       } else {
         console.warn("[easySubs][verifyPurchase] remote validation failed", {
           requestId,

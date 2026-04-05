@@ -14,6 +14,16 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMP_DIR="$(mktemp -d /tmp/easy-subs-firebase-XXXXXX)"
 STATE_FILE="$DIR/.deploy_state"
 
+NON_INTERACTIVE_MODE="false"
+if [ "${CI:-}" = "true" ] || [ "${NON_INTERACTIVE:-}" = "1" ] || ! [ -t 0 ]; then
+  NON_INTERACTIVE_MODE="true"
+fi
+
+FIREBASE_AUTH_FLAGS=()
+if [ -n "${FIREBASE_TOKEN:-}" ]; then
+  FIREBASE_AUTH_FLAGS+=(--token "$FIREBASE_TOKEN")
+fi
+
 resolve_optional_value() {
   local input="$1"
   local saved_value="$2"
@@ -258,6 +268,11 @@ review_and_edit_saved_values() {
   local edit_another_choice=""
   local edited_value="false"
 
+  if [ "$NON_INTERACTIVE_MODE" = "true" ]; then
+    USE_SAVED_VALUES_WITHOUT_REPROMPT="true"
+    return
+  fi
+
   if [ -n "$PROJECT_ID" ] && \
      [ -n "$APPLE_SHARED_SECRET" ] && \
      [ -n "$GOOGLE_PLAY_PACKAGE_NAME" ] && \
@@ -376,6 +391,10 @@ fi
 
 echo "✅ Firebase CLI detected."
 
+if [ "$NON_INTERACTIVE_MODE" = "true" ]; then
+  echo "ℹ️ Non-interactive mode detected."
+fi
+
 # Load previous values if available
 LAST_PROJECT_ID=""
 LAST_APPLE_SHARED_SECRET=""
@@ -416,11 +435,22 @@ if [ -z "$PROJECT_ID" ]; then
 fi
 
 echo "🔄 Configuring project: $PROJECT_ID..."
-firebase use --add "$PROJECT_ID" || firebase use "$PROJECT_ID"
+if [ "$NON_INTERACTIVE_MODE" = "true" ]; then
+  echo "ℹ️ Skipping 'firebase use --add' in non-interactive mode; deploy will use --project $PROJECT_ID."
+else
+  firebase use --add "$PROJECT_ID" "${FIREBASE_AUTH_FLAGS[@]}" || firebase use "$PROJECT_ID" "${FIREBASE_AUTH_FLAGS[@]}"
+fi
 
 echo ""
 echo "🔑 Verifying Firebase session..."
-firebase login
+if [ -n "${FIREBASE_TOKEN:-}" ]; then
+  echo "✅ FIREBASE_TOKEN detected. Skipping interactive login."
+elif [ "$NON_INTERACTIVE_MODE" = "true" ]; then
+  echo "⚠️ Skipping 'firebase login' in non-interactive mode."
+  echo "   Ensure you already ran 'firebase login' on this machine, or set FIREBASE_TOKEN."
+else
+  firebase login
+fi
 
 echo "📁 Preparing deployment environment in $TEMP_DIR..."
 rm -rf "$TEMP_DIR"
@@ -522,7 +552,7 @@ npm install --silent
 
 echo "☁️ Deploying to Firebase Cloud Functions for project $PROJECT_ID..."
 cd "$TEMP_DIR"
-if ! firebase deploy --only "functions:easySubs" --project "$PROJECT_ID" --force; then
+if ! firebase deploy --only "functions:easySubs" --project "$PROJECT_ID" --force "${FIREBASE_AUTH_FLAGS[@]}"; then
     echo "❌ Error during deployment."
     cd "$DIR"
     rm -rf "$TEMP_DIR"
