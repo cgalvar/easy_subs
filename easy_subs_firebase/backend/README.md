@@ -10,6 +10,14 @@ As part of the **Zero Trust** architecture, the client app never writes successf
 2. **`appleWebhook` (HTTP POST):** Exposes a public endpoint for Apple's App Store Server Notifications V2. Automatically updates expiration dates in Firestore when renewals happen while the user is offline.
 3. **`googlePubSubHandler` (Pub/Sub):** Bound to the Google Play Developer RTDN (Real-Time Developer Notifications) topic to handle android subscription states asynchronously.
 
+## Platform Guides
+
+- [Google Play Setup](GOOGLE_PLAY_SETUP.md)
+
+## Operational Helpers
+
+- `./google_play_test_notification_verifier.sh`: interactive verifier for Google Play RTDN test notifications. It tells you where to send the test notification, waits for confirmation, and then checks whether everything is healthy.
+
 ## Deployment Setup
 
 1. Copy the contents of this folder into your main Firebase functions project directory (usually `<project_root>/functions/`), or import them into your existing `index.js`.
@@ -27,3 +35,5 @@ As part of the **Zero Trust** architecture, the client app never writes successf
    ```bash
    firebase deploy --only functions
    ```
+
+When using the standalone `deploy.sh` in this folder with `gcloud` available, the script can also prepare Google Play RTDN infrastructure by verifying APIs, creating the `play-billing` topic, granting the Google Play publisher principal, and printing the runtime service account to add in Play Console.

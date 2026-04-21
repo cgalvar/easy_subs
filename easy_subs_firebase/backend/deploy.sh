@@ -24,6 +24,134 @@ if [ -n "${FIREBASE_TOKEN:-}" ]; then
   FIREBASE_AUTH_FLAGS+=(--token "$FIREBASE_TOKEN")
 fi
 
+GOOGLE_PLAY_RTDN_TOPIC_ID="${GOOGLE_PLAY_RTDN_TOPIC_ID:-play-billing}"
+GOOGLE_PLAY_RTDN_PUBLISHER_EMAIL="google-play-developer-notifications@system.gserviceaccount.com"
+GCLOUD_AVAILABLE="false"
+
+print_warning() {
+  echo "⚠️ $1"
+}
+
+print_success() {
+  echo "✅ $1"
+}
+
+ensure_required_google_api() {
+  local service_name="$1"
+
+  if [ "$GCLOUD_AVAILABLE" != "true" ]; then
+    return 1
+  fi
+
+  if gcloud services enable "$service_name" --project "$PROJECT_ID" > /dev/null 2>&1; then
+    print_success "Enabled or verified API: $service_name"
+    return 0
+  fi
+
+  print_warning "Could not enable API automatically: $service_name"
+  return 1
+}
+
+ensure_google_play_rtdn_topic() {
+  local topic_full_name="projects/${PROJECT_ID}/topics/${GOOGLE_PLAY_RTDN_TOPIC_ID}"
+
+  if [ "$GCLOUD_AVAILABLE" != "true" ]; then
+    print_warning "Skipping Pub/Sub automation because gcloud is not installed."
+    return 1
+  fi
+
+  echo ""
+  echo "🔧 Preparing Google Play RTDN infrastructure..."
+
+  ensure_required_google_api "pubsub.googleapis.com" || true
+  ensure_required_google_api "androidpublisher.googleapis.com" || true
+
+  if gcloud pubsub topics describe "$GOOGLE_PLAY_RTDN_TOPIC_ID" --project "$PROJECT_ID" > /dev/null 2>&1; then
+    print_success "Pub/Sub topic already exists: $topic_full_name"
+  elif gcloud pubsub topics create "$GOOGLE_PLAY_RTDN_TOPIC_ID" --project "$PROJECT_ID" > /dev/null 2>&1; then
+    print_success "Created Pub/Sub topic: $topic_full_name"
+  else
+    print_warning "Could not create Pub/Sub topic automatically: $topic_full_name"
+    return 1
+  fi
+
+  if gcloud pubsub topics add-iam-policy-binding "$GOOGLE_PLAY_RTDN_TOPIC_ID" \
+    --project "$PROJECT_ID" \
+    --member "serviceAccount:${GOOGLE_PLAY_RTDN_PUBLISHER_EMAIL}" \
+    --role "roles/pubsub.publisher" > /dev/null 2>&1; then
+    print_success "Verified Pub/Sub publisher permission for ${GOOGLE_PLAY_RTDN_PUBLISHER_EMAIL}"
+  else
+    print_warning "Could not grant Pub/Sub publisher permission automatically to ${GOOGLE_PLAY_RTDN_PUBLISHER_EMAIL}"
+  fi
+
+  return 0
+}
+
+get_runtime_service_account_email() {
+  local function_name="$1"
+  local runtime_service_account=""
+
+  if [ "$GCLOUD_AVAILABLE" != "true" ]; then
+    return 0
+  fi
+
+  runtime_service_account="$(gcloud functions describe "$function_name" \
+    --project "$PROJECT_ID" \
+    --region "$FUNCTIONS_REGION" \
+    --gen2 \
+    --format="value(serviceConfig.serviceAccountEmail)" 2> /dev/null || true)"
+
+  if [ -z "$runtime_service_account" ]; then
+    runtime_service_account="$(gcloud functions describe "$function_name" \
+      --project "$PROJECT_ID" \
+      --region "$FUNCTIONS_REGION" \
+      --format="value(serviceAccountEmail)" 2> /dev/null || true)"
+  fi
+
+  printf '%s' "$runtime_service_account"
+}
+
+run_firebase_deploy_attempt() {
+  local attempt="$1"
+  local log_file="$2"
+
+  if [ "$attempt" -eq 1 ]; then
+    firebase deploy --only "functions:easySubs" --project "$PROJECT_ID" --force "${FIREBASE_AUTH_FLAGS[@]}" > >(tee "$log_file") 2>&1
+  else
+    firebase deploy --only "functions:easySubs" --project "$PROJECT_ID" --force --debug "${FIREBASE_AUTH_FLAGS[@]}" > >(tee "$log_file") 2>&1
+  fi
+}
+
+deploy_easy_subs_functions() {
+  local max_attempts=2
+  local attempt=1
+  local log_file=""
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    log_file="$TEMP_DIR/firebase_deploy_attempt_${attempt}.log"
+
+    echo "☁️ Deploying to Firebase Cloud Functions for project $PROJECT_ID (attempt ${attempt}/${max_attempts})..."
+    if run_firebase_deploy_attempt "$attempt" "$log_file"; then
+      print_success "Firebase deploy succeeded on attempt ${attempt}."
+      return 0
+    fi
+
+    print_warning "Firebase deploy failed on attempt ${attempt}."
+    print_warning "Firebase CLI log saved at: $log_file"
+
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      echo "🔁 Retrying deploy once with Firebase debug output enabled..."
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  echo "❌ Error during deployment."
+  print_warning "Temporary deploy workspace preserved at: $TEMP_DIR"
+  print_warning "Inspect the last Firebase CLI log at: $log_file"
+  return 1
+}
+
 resolve_optional_value() {
   local input="$1"
   local saved_value="$2"
@@ -391,6 +519,13 @@ fi
 
 echo "✅ Firebase CLI detected."
 
+if command -v gcloud &> /dev/null; then
+  GCLOUD_AVAILABLE="true"
+  echo "✅ Google Cloud CLI detected."
+else
+  print_warning "Google Cloud CLI not detected. Topic/IAM automation and runtime service account discovery will be skipped."
+fi
+
 if [ "$NON_INTERACTIVE_MODE" = "true" ]; then
   echo "ℹ️ Non-interactive mode detected."
 fi
@@ -433,6 +568,8 @@ if [ -z "$PROJECT_ID" ]; then
   echo "❌ Error: Project ID cannot be empty."
   exit 1
 fi
+
+PLAY_BILLING_TOPIC_FULL_NAME="projects/${PROJECT_ID}/topics/${GOOGLE_PLAY_RTDN_TOPIC_ID}"
 
 echo "🔄 Configuring project: $PROJECT_ID..."
 if [ "$NON_INTERACTIVE_MODE" = "true" ]; then
@@ -517,6 +654,7 @@ else
 fi
 
 validate_apple_server_api_values
+ensure_google_play_rtdn_topic || true
 
 # Persist values for next runs (local-only)
 ESCAPED_APPLE_PRIVATE_KEY="$(escape_newlines "$APPLE_PRIVATE_KEY")"
@@ -550,13 +688,12 @@ echo "📦 Installing Node.js dependencies (this might take a few seconds)..."
 cd "$TEMP_DIR/functions"
 npm install --silent
 
-echo "☁️ Deploying to Firebase Cloud Functions for project $PROJECT_ID..."
+FUNCTIONS_REGION="${FUNCTIONS_REGION:-us-central1}"
+
 cd "$TEMP_DIR"
-if ! firebase deploy --only "functions:easySubs" --project "$PROJECT_ID" --force "${FIREBASE_AUTH_FLAGS[@]}"; then
-    echo "❌ Error during deployment."
-    cd "$DIR"
-    rm -rf "$TEMP_DIR"
-    exit 1
+if ! deploy_easy_subs_functions; then
+  cd "$DIR"
+  exit 1
 fi
 
 # Cleanup
@@ -564,9 +701,9 @@ cd "$DIR"
 echo "🧹 Cleaning up temporary files..."
 rm -rf "$TEMP_DIR"
 
-FUNCTIONS_REGION="${FUNCTIONS_REGION:-us-central1}"
 APPLE_WEBHOOK_URL="https://${FUNCTIONS_REGION}-${PROJECT_ID}.cloudfunctions.net/easySubs-appleWebhook"
 VERIFY_PURCHASE_CALLABLE_URL="https://${FUNCTIONS_REGION}-${PROJECT_ID}.cloudfunctions.net/easySubs-verifyPurchase"
+RUNTIME_SERVICE_ACCOUNT_EMAIL="$(get_runtime_service_account_email "easySubs-verifyPurchase")"
 
 echo ""
 echo "✅==========================================================✅"
@@ -577,13 +714,28 @@ echo ""
 echo "🔗 Integration endpoints"
 echo "- Apple webhook URL: $APPLE_WEBHOOK_URL"
 echo "- verifyPurchase callable URL (reference): $VERIFY_PURCHASE_CALLABLE_URL"
-echo "- Google Play RTDN topic (no URL in this setup): play-billing"
+echo "- Google Play RTDN topic (full name): $PLAY_BILLING_TOPIC_FULL_NAME"
+if [ -n "$RUNTIME_SERVICE_ACCOUNT_EMAIL" ]; then
+  echo "- Runtime service account: $RUNTIME_SERVICE_ACCOUNT_EMAIL"
+else
+  print_warning "Could not determine runtime service account automatically. Check the function details in Google Cloud Console."
+fi
 echo ""
 echo "📌 Configure these in their respective places:"
 echo "1) App Store Connect > Your App > App Store Server Notifications > Production Server URL"
 echo "   Paste: $APPLE_WEBHOOK_URL"
 echo "2) Google Play Console > Monetization setup > Real-time developer notifications"
-echo "   Set Cloud Pub/Sub topic: play-billing"
+echo "   Set Cloud Pub/Sub topic: $PLAY_BILLING_TOPIC_FULL_NAME"
+if [ -n "$RUNTIME_SERVICE_ACCOUNT_EMAIL" ]; then
+  echo "3) Google Play Console > Users and permissions or API access"
+  echo "   Add runtime service account: $RUNTIME_SERVICE_ACCOUNT_EMAIL"
+  echo "   Restrict access to the target Android app only"
+  echo "   Grant these permissions:"
+  echo "   - View app information and download bulk reports (read only)"
+  echo "   - View financial data, orders, and cancellation survey responses"
+  echo "   - Manage orders and subscriptions"
+  echo "   If Users and permissions does not allow this email, use API access instead"
+fi
 echo ""
 echo "ℹ️ If you deploy to a different region, replace ${FUNCTIONS_REGION} in the URLs above."
 echo ""
@@ -597,5 +749,9 @@ if [ -z "$APPLE_SHARED_SECRET" ] || [ -z "$GOOGLE_PLAY_PACKAGE_NAME" ]; then
 else
   echo "✅ Required env vars were provided and written to .env for this deploy."
 fi
+echo ""
+echo "🧪 RTDN log validation"
+echo "- Guided verifier: ./google_play_test_notification_verifier.sh $PROJECT_ID"
+echo "- The guided verifier tells you where to send the Play test notification, waits for confirmation, and then validates the logs."
 echo "✅==========================================================✅"
 echo ""

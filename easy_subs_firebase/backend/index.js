@@ -1,3 +1,4 @@
+const crypto = require("node:crypto");
 const { google } = require("googleapis");
 const jwt = require("jsonwebtoken");
 
@@ -5,6 +6,42 @@ const APPLE_VERIFY_RECEIPT_PRODUCTION_URL = "https://buy.itunes.apple.com/verify
 const APPLE_VERIFY_RECEIPT_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt";
 const APPLE_SERVER_API_PRODUCTION_URL = "https://api.storekit.itunes.apple.com";
 const APPLE_SERVER_API_SANDBOX_URL = "https://api.storekit-sandbox.itunes.apple.com";
+const DEFAULT_SUBSCRIPTIONS_COLLECTION = "subscriptions";
+const SUBSCRIPTION_SOURCES_SUBCOLLECTION = "sources";
+const VALID_PURCHASE_SOURCES = new Set(["app_store", "google_play"]);
+const GOOGLE_PLAY_RETRY_DELAYS_MS = [0, 1500, 4000];
+
+const fallbackLogger = {
+  info(message, metadata = {}) {
+    console.log(message, metadata);
+  },
+  warn(message, metadata = {}) {
+    console.warn(message, metadata);
+  },
+  error(message, metadata = {}) {
+    console.error(message, metadata);
+  },
+};
+
+function getLogger(functionsInstance) {
+  const logger = functionsInstance?.logger;
+  if (logger && typeof logger.info === "function") {
+    return logger;
+  }
+  return fallbackLogger;
+}
+
+function logInfo(functionsInstance, message, metadata = {}) {
+  getLogger(functionsInstance).info(message, metadata);
+}
+
+function logWarn(functionsInstance, message, metadata = {}) {
+  getLogger(functionsInstance).warn(message, metadata);
+}
+
+function logError(functionsInstance, message, metadata = {}) {
+  getLogger(functionsInstance).error(message, metadata);
+}
 
 function toMillis(value) {
   if (!value) return null;
@@ -29,6 +66,44 @@ function isLikelyJws(token) {
 
 function getConfigValue(functionsInstance, path, envKey) {
   return process.env[envKey];
+}
+
+function getSubscriptionsCollectionName(functionsInstance) {
+  return getConfigValue(
+    functionsInstance,
+    "easysubs.subscriptions_collection",
+    "EASY_SUBS_SUBSCRIPTIONS_COLLECTION",
+  ) || DEFAULT_SUBSCRIPTIONS_COLLECTION;
+}
+
+function getSubscriptionDocRef(adminInstance, userId, functionsInstance) {
+  return adminInstance.firestore
+    .collection(getSubscriptionsCollectionName(functionsInstance))
+    .doc(userId);
+}
+
+function getSubscriptionSourcesCollectionRef(adminInstance, userId, functionsInstance) {
+  return getSubscriptionDocRef(adminInstance, userId, functionsInstance)
+    .collection(SUBSCRIPTION_SOURCES_SUBCOLLECTION);
+}
+
+function normalizePurchaseSource(source) {
+  return typeof source === "string" ? source.trim().toLowerCase() : "";
+}
+
+function hashIdentifier(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 24);
+}
+
+function toComparableMillis(value) {
+  if (value == null) return null;
+  if (typeof value?.toMillis === "function") {
+    return value.toMillis();
+  }
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+  return toMillis(value);
 }
 
 function mapGoogleSubscriptionState(state) {
@@ -78,9 +153,137 @@ function isEntitledStatus(status) {
   return status === "active" || status === "trialing";
 }
 
-async function upsertSubscription(adminInstance, userId, data) {
-  console.log("[easySubs][subscriptions] upsert start", {
+function hasEffectiveEntitlement(sourceData = {}) {
+  const status = String(sourceData?.status || "").toLowerCase();
+  const expiryDateMs = toComparableMillis(sourceData?.expiryDateMs);
+
+  if (isEntitledStatus(status)) {
+    return true;
+  }
+
+  return status === "canceled" && typeof expiryDateMs === "number" && expiryDateMs > Date.now();
+}
+
+function getSourcePriority(sourceData = {}) {
+  const status = String(sourceData?.status || "").toLowerCase();
+  if (hasEffectiveEntitlement(sourceData)) {
+    return 3;
+  }
+  if (["paused", "on_hold", "canceled", "expired", "refunded", "revoked"].includes(status)) {
+    return 2;
+  }
+  if (["pending", "unknown", "invalid"].includes(status)) {
+    return 0;
+  }
+  return 1;
+}
+
+function buildSubscriptionSourceId({ source, details = {}, productId, verificationData }) {
+  const stableIdentifier =
+    details.originalTransactionId ||
+    details.transactionId ||
+    details.purchaseToken ||
+    details.linkedPurchaseToken ||
+    verificationData ||
+    productId ||
+    `${source}:${Date.now()}`;
+
+  return `${source}_${hashIdentifier(stableIdentifier)}`;
+}
+
+function selectWinningSource(sourceEntries = []) {
+  if (sourceEntries.length === 0) {
+    return null;
+  }
+
+  const sortedEntries = [...sourceEntries].sort((left, right) => {
+    const priorityDiff = getSourcePriority(right.data) - getSourcePriority(left.data);
+    if (priorityDiff !== 0) {
+      return priorityDiff;
+    }
+
+    const expiryDiff = (toComparableMillis(right.data?.expiryDateMs) || 0) - (toComparableMillis(left.data?.expiryDateMs) || 0);
+    if (expiryDiff !== 0) {
+      return expiryDiff;
+    }
+
+    const purchaseDiff = (toComparableMillis(right.data?.purchaseDateMs) || 0) - (toComparableMillis(left.data?.purchaseDateMs) || 0);
+    if (purchaseDiff !== 0) {
+      return purchaseDiff;
+    }
+
+    return (toComparableMillis(right.data?.updatedAt) || 0) - (toComparableMillis(left.data?.updatedAt) || 0);
+  });
+
+  return sortedEntries[0];
+}
+
+function buildSubscriptionAggregate({ userId, selectedSource, sourceCount }) {
+  const selectedSourceId = selectedSource?.sourceId || null;
+  const data = selectedSource?.data || {};
+
+  return {
     userId,
+    selectedSourceId,
+    sourceCount,
+    hasActiveEntitlement: hasEffectiveEntitlement(data),
+    planId: data?.planId || null,
+    platform: data?.platform || null,
+    status: data?.status || (sourceCount > 0 ? "unknown" : "invalid"),
+    reason: data?.reason || null,
+    expiryDateMs: toComparableMillis(data?.expiryDateMs),
+    purchaseDateMs: toComparableMillis(data?.purchaseDateMs),
+    cancellationDateMs: toComparableMillis(data?.cancellationDateMs),
+    revocationDateMs: toComparableMillis(data?.revocationDateMs),
+    purchaseToken: data?.purchaseToken || null,
+    linkedPurchaseToken: data?.linkedPurchaseToken || null,
+    originalTransactionId: data?.originalTransactionId || null,
+    transactionId: data?.transactionId || null,
+    latestOrderId: data?.latestOrderId || null,
+    externalAccountIdentifiers: data?.externalAccountIdentifiers || null,
+    productIdFromStore: data?.productIdFromStore || null,
+    productIdMatches: data?.productIdMatches ?? null,
+    rawSubscriptionState: data?.rawSubscriptionState || null,
+    autoRenewStatus: data?.autoRenewStatus ?? null,
+    acknowledged: data?.acknowledged ?? null,
+    acknowledgementRequired: data?.acknowledgementRequired ?? null,
+    refreshedUsingStoredToken: data?.refreshedUsingStoredToken ?? null,
+    tokenCandidateCount: data?.tokenCandidateCount ?? null,
+    appAccountToken: data?.appAccountToken || null,
+    storefront: data?.storefront || null,
+    transactionReason: data?.transactionReason || null,
+    webOrderLineItemId: data?.webOrderLineItemId || null,
+    appleEnvironment: data?.appleEnvironment || null,
+    appleStatus: data?.appleStatus || null,
+    appleVerificationMode: data?.appleVerificationMode || null,
+    appleLookupDeferred: data?.appleLookupDeferred ?? null,
+    appleLookupErrorCode: data?.appleLookupErrorCode ?? null,
+    notificationType: data?.notificationType || null,
+    notificationSubtype: data?.notificationSubtype || null,
+    rtdnNotificationType: data?.rtdnNotificationType || null,
+  };
+}
+
+function buildGoogleApiErrorMetadata(error) {
+  return {
+    code: error?.code || null,
+    status: error?.response?.status || error?.status || null,
+    message: error?.message || String(error),
+    errors: error?.errors || null,
+  };
+}
+
+function isRetryableGoogleApiError(error) {
+  const statusCode = error?.response?.status || error?.status || error?.code;
+  return statusCode === 408 || statusCode === 429 || (statusCode >= 500 && statusCode < 600);
+}
+
+async function upsertSubscription(adminInstance, userId, data, functionsInstance) {
+  const collectionName = getSubscriptionsCollectionName(functionsInstance);
+
+  logInfo(functionsInstance, "[easySubs][subscriptions] upsert start", {
+    userId,
+    collectionName,
     status: data?.status || null,
     platform: data?.platform || null,
     notificationType: data?.notificationType || null,
@@ -89,48 +292,116 @@ async function upsertSubscription(adminInstance, userId, data) {
     expiryDateMs: data?.expiryDateMs || null,
   });
 
-  await adminInstance.firestore.collection("subscriptions").doc(userId).set(
+  await getSubscriptionDocRef(adminInstance, userId, functionsInstance).set(
     {
       userId,
       ...data,
       updatedAt: adminInstance.FieldValue.serverTimestamp(),
     },
-    { merge: true },
   );
 
-  console.log("[easySubs][subscriptions] upsert done", {
+  logInfo(functionsInstance, "[easySubs][subscriptions] upsert done", {
     userId,
+    collectionName,
     status: data?.status || null,
     platform: data?.platform || null,
   });
 }
 
-async function findSubscriptionByField(adminInstance, field, value) {
+async function upsertSubscriptionSource(adminInstance, userId, sourceId, data, functionsInstance) {
+  logInfo(functionsInstance, "[easySubs][subscriptionSources] upsert start", {
+    userId,
+    sourceId,
+    platform: data?.platform || null,
+    status: data?.status || null,
+    planId: data?.planId || null,
+  });
+
+  await getSubscriptionSourcesCollectionRef(adminInstance, userId, functionsInstance)
+    .doc(sourceId)
+    .set(
+      {
+        sourceId,
+        ownerUserId: userId,
+        ...data,
+        updatedAt: adminInstance.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+  logInfo(functionsInstance, "[easySubs][subscriptionSources] upsert done", {
+    userId,
+    sourceId,
+    platform: data?.platform || null,
+    status: data?.status || null,
+  });
+}
+
+async function recomputeSubscriptionAggregate(adminInstance, userId, functionsInstance) {
+  const sourcesSnapshot = await getSubscriptionSourcesCollectionRef(
+    adminInstance,
+    userId,
+    functionsInstance,
+  ).get();
+
+  const sourceEntries = sourcesSnapshot.docs.map((doc) => ({
+    sourceId: doc.id,
+    data: doc.data() || {},
+  }));
+
+  const selectedSource = selectWinningSource(sourceEntries);
+  const aggregate = buildSubscriptionAggregate({
+    userId,
+    selectedSource,
+    sourceCount: sourceEntries.length,
+  });
+
+  await upsertSubscription(adminInstance, userId, aggregate, functionsInstance);
+
+  logInfo(functionsInstance, "[easySubs][subscriptions] aggregate recomputed", {
+    userId,
+    selectedSourceId: aggregate.selectedSourceId,
+    status: aggregate.status,
+    planId: aggregate.planId,
+    sourceCount: aggregate.sourceCount,
+  });
+
+  return {
+    aggregate,
+    selectedSource,
+  };
+}
+
+async function findSubscriptionByField(adminInstance, field, value, functionsInstance) {
+  const collectionName = getSubscriptionsCollectionName(functionsInstance);
+
   if (!value) {
-    console.warn("[easySubs][subscriptions] find skipped: empty value", { field });
+    logWarn(functionsInstance, "[easySubs][subscriptions] find skipped: empty value", { field, collectionName });
     return null;
   }
 
-  console.log("[easySubs][subscriptions] find start", {
+  logInfo(functionsInstance, "[easySubs][subscriptions] find start", {
     field,
+    collectionName,
     valuePreview: String(value).slice(0, 24),
     valueLength: String(value).length,
   });
 
   const snap = await adminInstance.firestore
-    .collection("subscriptions")
+    .collection(collectionName)
     .where(field, "==", value)
     .limit(1)
     .get();
 
   if (snap.empty) {
-    console.warn("[easySubs][subscriptions] find empty", { field });
+    logWarn(functionsInstance, "[easySubs][subscriptions] find empty", { field, collectionName });
     return null;
   }
 
   const doc = snap.docs[0];
-  console.log("[easySubs][subscriptions] find hit", {
+  logInfo(functionsInstance, "[easySubs][subscriptions] find hit", {
     field,
+    collectionName,
     userId: doc.id,
     docKeys: Object.keys(doc.data() || {}),
   });
@@ -139,6 +410,147 @@ async function findSubscriptionByField(adminInstance, field, value) {
     userId: doc.id,
     data: doc.data(),
   };
+}
+
+async function getSubscriptionByUserId(adminInstance, userId, functionsInstance) {
+  const collectionName = getSubscriptionsCollectionName(functionsInstance);
+  const snapshot = await getSubscriptionDocRef(adminInstance, userId, functionsInstance).get();
+
+  if (!snapshot.exists) {
+    logWarn(functionsInstance, "[easySubs][subscriptions] get by user empty", {
+      collectionName,
+      userId,
+    });
+    return null;
+  }
+
+  return {
+    userId: snapshot.id,
+    data: snapshot.data() || {},
+  };
+}
+
+async function findSubscriptionSourceByField(adminInstance, field, value, functionsInstance) {
+  if (!value) {
+    return null;
+  }
+
+  const snapshot = await adminInstance.firestore
+    .collectionGroup(SUBSCRIPTION_SOURCES_SUBCOLLECTION)
+    .where(field, "==", value)
+    .limit(1)
+    .get();
+
+  if (snapshot.empty) {
+    return null;
+  }
+
+  const doc = snapshot.docs[0];
+  const parentDoc = doc.ref.parent.parent;
+  return {
+    userId: parentDoc?.id || null,
+    sourceId: doc.id,
+    data: doc.data() || {},
+  };
+}
+
+async function findSubscriptionSourceByGoogleTokens(adminInstance, { purchaseToken, linkedPurchaseToken, functionsInstance }) {
+  const candidates = [
+    { field: "purchaseToken", value: purchaseToken },
+    { field: "linkedPurchaseToken", value: purchaseToken },
+    { field: "purchaseToken", value: linkedPurchaseToken },
+    { field: "linkedPurchaseToken", value: linkedPurchaseToken },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.value) {
+      continue;
+    }
+
+    const source = await findSubscriptionSourceByField(
+      adminInstance,
+      candidate.field,
+      candidate.value,
+      functionsInstance,
+    );
+
+    if (source) {
+      return source;
+    }
+  }
+
+  return null;
+}
+
+async function findSubscriptionSourceByAppleIdentifiers(adminInstance, { originalTransactionId, transactionId, functionsInstance }) {
+  const candidates = [
+    { field: "originalTransactionId", value: originalTransactionId },
+    { field: "transactionId", value: transactionId },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.value) {
+      continue;
+    }
+
+    const source = await findSubscriptionSourceByField(
+      adminInstance,
+      candidate.field,
+      candidate.value,
+      functionsInstance,
+    );
+
+    if (source) {
+      return source;
+    }
+  }
+
+  return null;
+}
+
+function collectUniqueStrings(values) {
+  const unique = [];
+  for (const value of values) {
+    if (typeof value !== "string") {
+      continue;
+    }
+
+    const normalized = value.trim();
+    if (!normalized || unique.includes(normalized)) {
+      continue;
+    }
+
+    unique.push(normalized);
+  }
+  return unique;
+}
+
+async function findSubscriptionByGoogleTokens(adminInstance, { purchaseToken, linkedPurchaseToken, functionsInstance }) {
+  const candidates = [
+    { field: "purchaseToken", value: purchaseToken },
+    { field: "linkedPurchaseToken", value: purchaseToken },
+    { field: "purchaseToken", value: linkedPurchaseToken },
+    { field: "linkedPurchaseToken", value: linkedPurchaseToken },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.value) {
+      continue;
+    }
+
+    const subscription = await findSubscriptionByField(
+      adminInstance,
+      candidate.field,
+      candidate.value,
+      functionsInstance,
+    );
+
+    if (subscription) {
+      return subscription;
+    }
+  }
+
+  return null;
 }
 
 async function verifyAppleReceiptWithEndpoint(url, receiptData, sharedSecret) {
@@ -230,6 +642,54 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchGoogleSubscription({ verificationData, packageName, productId, functionsInstance, logContext = {} }) {
+  const auth = new google.auth.GoogleAuth({
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+  const authClient = await auth.getClient();
+  const androidpublisher = google.androidpublisher({ version: "v3", auth: authClient });
+
+  let lastError;
+
+  for (const delayMs of GOOGLE_PLAY_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+
+    try {
+      logInfo(functionsInstance, "[easySubs][googlePlay] subscription lookup attempt", {
+        ...logContext,
+        packageName,
+        productId,
+        delayMs,
+        tokenLength: verificationData ? String(verificationData).length : 0,
+      });
+
+      const response = await androidpublisher.purchases.subscriptionsv2.get({
+        packageName,
+        token: verificationData,
+      });
+
+      return response.data || {};
+    } catch (error) {
+      lastError = error;
+      logWarn(functionsInstance, "[easySubs][googlePlay] subscription lookup failed", {
+        ...logContext,
+        packageName,
+        productId,
+        delayMs,
+        ...buildGoogleApiErrorMetadata(error),
+      });
+
+      if (!isRetryableGoogleApiError(error)) {
+        break;
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 function isAppleTransactionNotFoundError(error) {
   return error?.statusCode === 404 && error?.appleErrorCode === 4040010;
 }
@@ -281,7 +741,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
   }
 
   const decodedToken = safeJwtDecode(verificationData) || {};
-  console.log("[easySubs][verifyAppleServerApi] decoded token metadata", {
+  logInfo(functionsInstance, "[easySubs][verifyAppleServerApi] decoded token metadata", {
     tokenLength: verificationData ? String(verificationData).length : 0,
     tokenPrefix: verificationData ? String(verificationData).slice(0, 24) : null,
     decodedKeys: Object.keys(decodedToken || {}),
@@ -310,7 +770,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
   const retryDelaysMs = [0, 1500, 4000];
 
   for (const delayMs of retryDelaysMs) {
-    console.log("[easySubs][verifyAppleServerApi] lookup attempt", {
+    logInfo(functionsInstance, "[easySubs][verifyAppleServerApi] lookup attempt", {
       transactionId,
       delayMs,
       productId,
@@ -328,7 +788,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
       environment = "Production";
       break;
     } catch (error) {
-      console.warn("[easySubs][verifyAppleServerApi] production lookup failed", {
+      logWarn(functionsInstance, "[easySubs][verifyAppleServerApi] production lookup failed", {
         transactionId,
         statusCode: error?.statusCode || null,
         appleErrorCode: error?.appleErrorCode || null,
@@ -346,7 +806,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
       environment = "Sandbox";
       break;
     } catch (error) {
-      console.warn("[easySubs][verifyAppleServerApi] sandbox lookup failed", {
+      logWarn(functionsInstance, "[easySubs][verifyAppleServerApi] sandbox lookup failed", {
         transactionId,
         statusCode: error?.statusCode || null,
         appleErrorCode: error?.appleErrorCode || null,
@@ -360,7 +820,7 @@ async function verifyApplePurchaseByServerApi({ verificationData, productId, fun
     const productMatches = !productId || !parsedFromSignedTransaction.productId || parsedFromSignedTransaction.productId === productId;
 
     if (isAppleTransactionNotFoundError(lastError) && parsedFromSignedTransaction.hasTransaction && productMatches) {
-      console.warn("[easySubs][verifyPurchase] Apple transaction not found in Server API", {
+      logWarn(functionsInstance, "[easySubs][verifyPurchase] Apple transaction not found in Server API", {
         transactionId,
         productId,
         productIdFromStore: parsedFromSignedTransaction.productId,
@@ -520,44 +980,303 @@ async function verifyGooglePurchase({ verificationData, productId, functionsInst
     throw new Error("Missing GOOGLE_PLAY_PACKAGE_NAME environment variable");
   }
 
-  const auth = new google.auth.GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-  });
-  const authClient = await auth.getClient();
-  const androidpublisher = google.androidpublisher({ version: "v3", auth: authClient });
-
-  const response = await androidpublisher.purchases.subscriptionsv2.get({
+  const sub = await fetchGoogleSubscription({
+    verificationData,
     packageName,
-    token: verificationData,
+    productId,
+    functionsInstance,
+    logContext: {
+      verificationMode: "verify_purchase",
+    },
   });
-
-  const sub = response.data || {};
   const lineItems = Array.isArray(sub.lineItems) ? sub.lineItems : [];
-  const line = lineItems[0] || {};
+  const line = (productId
+    ? lineItems.find((item) => item?.productId === productId)
+    : null) || lineItems[0] || {};
   const expiryDateMs = line.expiryTime ? new Date(line.expiryTime).getTime() : null;
+  const productIdFromStore = line.productId || null;
+  const productIdMatches = !productId || !productIdFromStore || productIdFromStore === productId;
+  const acknowledged = sub.acknowledgementState === "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED";
 
   const status = mapGoogleSubscriptionState(sub.subscriptionState);
-  const isValid = ["active", "trialing"].includes(status);
+  const isValid = isEntitledStatus(status) && productIdMatches;
 
   return {
     isValid,
     details: {
       platform: "google_play",
       status,
-      reason: null,
+      reason: productIdMatches ? null : "product_id_mismatch",
       appleLookupDeferred: null,
       appleLookupErrorCode: null,
       purchaseToken: verificationData,
       planId: productId,
+      productIdFromStore,
+      productIdMatches,
       linkedPurchaseToken: sub.linkedPurchaseToken || null,
       externalAccountIdentifiers: sub.externalAccountIdentifiers || null,
       latestOrderId: line.latestSuccessfulOrderId || null,
       expiryDateMs,
-      acknowledged:
-        sub.acknowledgementState === "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+      acknowledged,
+      acknowledgementRequired: isEntitledStatus(status) && !acknowledged,
       rawSubscriptionState: sub.subscriptionState || null,
     },
   };
+}
+
+async function refreshGooglePurchaseStatus({
+  adminInstance,
+  userId,
+  productId,
+  verificationData,
+  functionsInstance,
+}) {
+  const storedSubscription = await getSubscriptionByUserId(
+    adminInstance,
+    userId,
+    functionsInstance,
+  );
+
+  const candidateTokens = collectUniqueStrings([
+    verificationData,
+    storedSubscription?.data?.purchaseToken,
+    storedSubscription?.data?.linkedPurchaseToken,
+  ]);
+
+  if (candidateTokens.length === 0) {
+    return {
+      isValid: false,
+      details: {
+        platform: "google_play",
+        status: "invalid",
+        reason: "missing_purchase_token",
+        appleLookupDeferred: null,
+        appleLookupErrorCode: null,
+      },
+    };
+  }
+
+  let lastError;
+
+  for (const token of candidateTokens) {
+    try {
+      const verification = await verifyGooglePurchase({
+        verificationData: token,
+        productId,
+        functionsInstance,
+      });
+
+      return {
+        isValid: verification.isValid,
+        details: {
+          ...verification.details,
+          refreshedUsingStoredToken: token !== verificationData,
+          tokenCandidateCount: candidateTokens.length,
+        },
+      };
+    } catch (error) {
+      lastError = error;
+      logWarn(functionsInstance, "[easySubs][refreshPurchaseStatus] google token refresh attempt failed", {
+        userId,
+        productId,
+        usedProvidedToken: token === verificationData,
+        ...buildGoogleApiErrorMetadata(error),
+      });
+    }
+  }
+
+  throw lastError;
+}
+
+function buildOwnershipConflictError({ userId, ownerUserId, sourceId, source }) {
+  const error = new Error(
+    `This ${source} purchase is already associated with another account. owner=${ownerUserId} requested=${userId} sourceId=${sourceId}`,
+  );
+  error.code = "purchase-owner-conflict";
+  return error;
+}
+
+async function resolveAppleSourceReference({
+  adminInstance,
+  userId,
+  details,
+  productId,
+  verificationData,
+  functionsInstance,
+}) {
+  const existingSource = await findSubscriptionSourceByAppleIdentifiers(adminInstance, {
+    originalTransactionId: details?.originalTransactionId,
+    transactionId: details?.transactionId,
+    functionsInstance,
+  });
+
+  if (existingSource) {
+    if (existingSource.userId !== userId) {
+      throw buildOwnershipConflictError({
+        userId,
+        ownerUserId: existingSource.userId,
+        sourceId: existingSource.sourceId,
+        source: "app_store",
+      });
+    }
+
+    return {
+      userId,
+      sourceId: existingSource.sourceId,
+      existingData: existingSource.data,
+    };
+  }
+
+  const legacySubscription =
+    await findSubscriptionByField(
+      adminInstance,
+      "originalTransactionId",
+      details?.originalTransactionId,
+      functionsInstance,
+    ) ||
+    await findSubscriptionByField(
+      adminInstance,
+      "transactionId",
+      details?.transactionId,
+      functionsInstance,
+    );
+
+  if (legacySubscription && legacySubscription.userId !== userId) {
+    throw buildOwnershipConflictError({
+      userId,
+      ownerUserId: legacySubscription.userId,
+      sourceId: buildSubscriptionSourceId({
+        source: "app_store",
+        details: legacySubscription.data,
+        productId,
+        verificationData,
+      }),
+      source: "app_store",
+    });
+  }
+
+  return {
+    userId,
+    sourceId: buildSubscriptionSourceId({
+      source: "app_store",
+      details: legacySubscription?.data || details,
+      productId,
+      verificationData,
+    }),
+    existingData: legacySubscription?.data || null,
+  };
+}
+
+async function resolveGoogleSourceReference({
+  adminInstance,
+  userId,
+  details,
+  productId,
+  verificationData,
+  functionsInstance,
+}) {
+  const existingSource = await findSubscriptionSourceByGoogleTokens(adminInstance, {
+    purchaseToken: details?.purchaseToken || verificationData,
+    linkedPurchaseToken: details?.linkedPurchaseToken,
+    functionsInstance,
+  });
+
+  if (existingSource) {
+    if (existingSource.userId !== userId) {
+      throw buildOwnershipConflictError({
+        userId,
+        ownerUserId: existingSource.userId,
+        sourceId: existingSource.sourceId,
+        source: "google_play",
+      });
+    }
+
+    return {
+      userId,
+      sourceId: existingSource.sourceId,
+      existingData: existingSource.data,
+    };
+  }
+
+  const legacySubscription = await findSubscriptionByGoogleTokens(adminInstance, {
+    purchaseToken: details?.purchaseToken || verificationData,
+    linkedPurchaseToken: details?.linkedPurchaseToken,
+    functionsInstance,
+  });
+
+  if (legacySubscription && legacySubscription.userId !== userId) {
+    throw buildOwnershipConflictError({
+      userId,
+      ownerUserId: legacySubscription.userId,
+      sourceId: buildSubscriptionSourceId({
+        source: "google_play",
+        details: legacySubscription.data,
+        productId,
+        verificationData,
+      }),
+      source: "google_play",
+    });
+  }
+
+  return {
+    userId,
+    sourceId: buildSubscriptionSourceId({
+      source: "google_play",
+      details: legacySubscription?.data || details,
+      productId,
+      verificationData,
+    }),
+    existingData: legacySubscription?.data || null,
+  };
+}
+
+async function resolveSourceReferenceForUser({
+  adminInstance,
+  userId,
+  source,
+  details,
+  productId,
+  verificationData,
+  functionsInstance,
+}) {
+  if (source === "app_store") {
+    return resolveAppleSourceReference({
+      adminInstance,
+      userId,
+      details,
+      productId,
+      verificationData,
+      functionsInstance,
+    });
+  }
+
+  if (source === "google_play") {
+    return resolveGoogleSourceReference({
+      adminInstance,
+      userId,
+      details,
+      productId,
+      verificationData,
+      functionsInstance,
+    });
+  }
+
+  return {
+    userId,
+    sourceId: buildSubscriptionSourceId({ source, details, productId, verificationData }),
+    existingData: null,
+  };
+}
+
+async function persistSubscriptionSourceAndAggregate({
+  adminInstance,
+  userId,
+  sourceId,
+  data,
+  functionsInstance,
+}) {
+  await upsertSubscriptionSource(adminInstance, userId, sourceId, data, functionsInstance);
+  return recomputeSubscriptionAggregate(adminInstance, userId, functionsInstance);
 }
 
 /**
@@ -571,8 +1290,11 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
 
   const verifyPurchase = functionsInstance.https.onCall(async (data, context) => {
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const { source, productId, verificationData } = data;
-    console.log("[easySubs][verifyPurchase] incoming request", {
+    const source = normalizePurchaseSource(data?.source);
+    const productId = typeof data?.productId === "string" ? data.productId.trim() : "";
+    const verificationData = typeof data?.verificationData === "string" ? data.verificationData.trim() : "";
+
+    logInfo(functionsInstance, "[easySubs][verifyPurchase] incoming request", {
       requestId,
       hasAuth: Boolean(context.auth),
       uid: context.auth?.uid || null,
@@ -591,9 +1313,21 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
     }
 
     const userId = context.auth.uid;
-    console.log("[easySubs][verifyPurchase] authenticated", { requestId, userId });
+    logInfo(functionsInstance, "[easySubs][verifyPurchase] authenticated", { requestId, userId });
 
     try {
+      if (!VALID_PURCHASE_SOURCES.has(source)) {
+        throw new functionsInstance.https.HttpsError("invalid-argument", "Invalid source provided.");
+      }
+
+      if (!productId) {
+        throw new functionsInstance.https.HttpsError("invalid-argument", "Missing productId.");
+      }
+
+      if (!verificationData) {
+        throw new functionsInstance.https.HttpsError("invalid-argument", "Missing verificationData.");
+      }
+
       let verification;
       if (source === "app_store") {
         verification = await verifyApplePurchase({ verificationData, productId, functionsInstance });
@@ -603,43 +1337,68 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
         throw new functionsInstance.https.HttpsError("invalid-argument", "Invalid source provided.");
       }
 
-      if (verification.isValid) {
-        console.log("[easySubs][verifyPurchase] writing subscriptions doc", { requestId, userId, planId: productId, verificationDetails: verification.details || null });
-        await upsertSubscription(adminInstance, userId, {
-          planId: productId,
-          ...verification.details,
-        });
+      const resolvedSource = await resolveSourceReferenceForUser({
+        adminInstance,
+        userId,
+        source,
+        details: verification.details || {},
+        productId,
+        verificationData,
+        functionsInstance,
+      });
 
-        console.log("[easySubs][verifyPurchase] success", { requestId, userId, planId: productId });
+      const persistedState = await persistSubscriptionSourceAndAggregate({
+        adminInstance,
+        userId,
+        sourceId: resolvedSource.sourceId,
+        data: {
+          planId: productId,
+          platform: source,
+          ...(resolvedSource.existingData || {}),
+          ...(verification.details || {}),
+        },
+        functionsInstance,
+      });
+
+      if (verification.isValid) {
+        logInfo(functionsInstance, "[easySubs][verifyPurchase] success", {
+          requestId,
+          userId,
+          planId: productId,
+          sourceId: resolvedSource.sourceId,
+          aggregate: persistedState.aggregate,
+        });
 
         return {
           success: true,
           message: "Purchase verified successfully.",
-          details: verification.details || {},
+          details: persistedState.aggregate || {},
         };
       } else {
-        console.warn("[easySubs][verifyPurchase] remote validation failed", {
+        logWarn(functionsInstance, "[easySubs][verifyPurchase] remote validation failed", {
           requestId,
           userId,
           source,
           productId,
           details: verification.details || null,
         });
-        await upsertSubscription(adminInstance, userId, {
-          planId: productId,
-          platform: source,
-          status: verification.details?.status || "invalid",
-          ...verification.details,
-        });
         return {
           success: false,
-          message: `Receipt validation failed remotely. details=${JSON.stringify(verification.details || {})}`,
-          details: verification.details || {},
+          message: `Receipt validation failed remotely. details=${JSON.stringify(persistedState.aggregate || {})}`,
+          details: persistedState.aggregate || {},
         };
       }
 
     } catch (error) {
-      console.error("[easySubs][verifyPurchase] unhandled error", {
+      if (error?.code === "purchase-owner-conflict") {
+        throw new functionsInstance.https.HttpsError("failed-precondition", error.message);
+      }
+
+      if (error instanceof functionsInstance.https.HttpsError) {
+        throw error;
+      }
+
+      logError(functionsInstance, "[easySubs][verifyPurchase] unhandled error", {
         requestId,
         message: error?.message || String(error),
         stack: error?.stack || null,
@@ -649,10 +1408,139 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
     }
   });
 
+  const refreshPurchaseStatus = functionsInstance.https.onCall(async (data, context) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const source = normalizePurchaseSource(data?.source);
+    const productId = typeof data?.productId === "string" ? data.productId.trim() : "";
+    const verificationData = typeof data?.verificationData === "string" ? data.verificationData.trim() : "";
+
+    logInfo(functionsInstance, "[easySubs][refreshPurchaseStatus] incoming request", {
+      requestId,
+      hasAuth: Boolean(context.auth),
+      uid: context.auth?.uid || null,
+      source,
+      productId,
+      verificationDataLength: verificationData ? String(verificationData).length : 0,
+      verificationDataIsJws: isLikelyJws(verificationData),
+      verificationDataPrefix: verificationData ? String(verificationData).slice(0, 24) : null,
+    });
+
+    if (!context.auth) {
+      throw new functionsInstance.https.HttpsError(
+        "unauthenticated",
+        "The function must be called while authenticated.",
+      );
+    }
+
+    const userId = context.auth.uid;
+
+    try {
+      if (!VALID_PURCHASE_SOURCES.has(source)) {
+        throw new functionsInstance.https.HttpsError("invalid-argument", "Invalid source provided.");
+      }
+
+      if (!productId) {
+        throw new functionsInstance.https.HttpsError("invalid-argument", "Missing productId.");
+      }
+
+      let verification;
+      if (source === "google_play") {
+        verification = await refreshGooglePurchaseStatus({
+          adminInstance,
+          userId,
+          productId,
+          verificationData,
+          functionsInstance,
+        });
+      } else {
+        if (!verificationData) {
+          throw new functionsInstance.https.HttpsError(
+            "invalid-argument",
+            "Missing verificationData for App Store refresh.",
+          );
+        }
+
+        verification = await verifyApplePurchase({
+          verificationData,
+          productId,
+          functionsInstance,
+        });
+      }
+
+      const resolvedSource = await resolveSourceReferenceForUser({
+        adminInstance,
+        userId,
+        source,
+        details: verification.details || {},
+        productId,
+        verificationData,
+        functionsInstance,
+      });
+
+      const persistedState = await persistSubscriptionSourceAndAggregate({
+        adminInstance,
+        userId,
+        sourceId: resolvedSource.sourceId,
+        data: {
+          planId: productId,
+          platform: source,
+          ...(resolvedSource.existingData || {}),
+          ...(verification.details || {}),
+        },
+        functionsInstance,
+      });
+
+      if (verification.isValid) {
+        logInfo(functionsInstance, "[easySubs][refreshPurchaseStatus] success", {
+          requestId,
+          userId,
+          productId,
+          sourceId: resolvedSource.sourceId,
+          details: persistedState.aggregate || null,
+        });
+        return {
+          success: true,
+          message: "Purchase status refreshed successfully.",
+          details: persistedState.aggregate || {},
+        };
+      }
+
+      logWarn(functionsInstance, "[easySubs][refreshPurchaseStatus] non-entitled status", {
+        requestId,
+        userId,
+        source,
+        productId,
+        details: persistedState.aggregate || null,
+      });
+      return {
+        success: false,
+        message: `Purchase status refresh completed without entitlement. details=${JSON.stringify(persistedState.aggregate || {})}`,
+        details: persistedState.aggregate || {},
+      };
+    } catch (error) {
+      if (error?.code === "purchase-owner-conflict") {
+        throw new functionsInstance.https.HttpsError("failed-precondition", error.message);
+      }
+
+      if (error instanceof functionsInstance.https.HttpsError) {
+        throw error;
+      }
+
+      logError(functionsInstance, "[easySubs][refreshPurchaseStatus] unhandled error", {
+        requestId,
+        userId,
+        message: error?.message || String(error),
+        stack: error?.stack || null,
+        code: error?.code || null,
+      });
+      throw new functionsInstance.https.HttpsError("internal", "An error occurred during purchase refresh.");
+    }
+  });
+
   const appleWebhook = functionsInstance.https.onRequest(async (req, res) => {
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     try {
-      console.log("[easySubs][appleWebhook] incoming", {
+      logInfo(functionsInstance, "[easySubs][appleWebhook] incoming", {
         requestId,
         method: req.method,
         path: req.path,
@@ -666,11 +1554,11 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
       });
 
       if (req.method !== "POST") {
-        console.warn("[easySubs][appleWebhook] unexpected method", { requestId, method: req.method });
+        logWarn(functionsInstance, "[easySubs][appleWebhook] unexpected method", { requestId, method: req.method });
       }
 
       const signedPayload = req.body?.signedPayload;
-      console.log("[easySubs][appleWebhook] signedPayload metadata", {
+      logInfo(functionsInstance, "[easySubs][appleWebhook] signedPayload metadata", {
         requestId,
         hasSignedPayload: Boolean(signedPayload),
         signedPayloadLength: signedPayload ? String(signedPayload).length : 0,
@@ -678,14 +1566,14 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
       });
 
       if (!signedPayload) {
-        console.warn("[easySubs][appleWebhook] missing signedPayload", { requestId });
+        logWarn(functionsInstance, "[easySubs][appleWebhook] missing signedPayload", { requestId });
         res.status(400).send("Missing signedPayload");
         return;
       }
 
       const decodedPayload = safeJwtDecode(signedPayload);
       if (!decodedPayload) {
-        console.warn("[easySubs][appleWebhook] invalid signedPayload", { requestId });
+        logWarn(functionsInstance, "[easySubs][appleWebhook] invalid signedPayload", { requestId });
         res.status(400).send("Invalid signedPayload");
         return;
       }
@@ -707,7 +1595,7 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
 
       const status = mapAppleWebhookStatus(notificationType, subtype);
 
-      console.log("[easySubs][appleWebhook] parsed", {
+      logInfo(functionsInstance, "[easySubs][appleWebhook] parsed", {
         requestId,
         notificationType,
         subtype,
@@ -720,23 +1608,32 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
       });
 
       if (!originalTransactionId) {
-        console.warn("[easySubs][appleWebhook] no originalTransactionId, skipping upsert", { requestId });
+        logWarn(functionsInstance, "[easySubs][appleWebhook] no originalTransactionId, skipping upsert", { requestId });
         res.status(200).send("OK");
         return;
       }
 
-      console.log("[easySubs][appleWebhook] finding subscription by originalTransactionId", {
+      logInfo(functionsInstance, "[easySubs][appleWebhook] finding subscription by originalTransactionId", {
         requestId,
         originalTransactionId,
       });
-      const sub = await findSubscriptionByField(
+      const sourceMatch = await findSubscriptionSourceByAppleIdentifiers(
+        adminInstance,
+        {
+          originalTransactionId,
+          transactionId: transactionInfo.transactionId || null,
+          functionsInstance,
+        },
+      );
+      const sub = sourceMatch || await findSubscriptionByField(
         adminInstance,
         "originalTransactionId",
         originalTransactionId,
+        functionsInstance,
       );
 
       if (!sub) {
-        console.warn("[easySubs][appleWebhook] subscription not found for originalTransactionId", {
+        logWarn(functionsInstance, "[easySubs][appleWebhook] subscription not found for originalTransactionId", {
           requestId,
           originalTransactionId,
         });
@@ -748,40 +1645,60 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
         ? new Date(transactionInfo.expiresDate).getTime()
         : toMillis(transactionInfo.expiresDateMs);
 
-      await upsertSubscription(adminInstance, sub.userId, {
-        platform: "app_store",
-        status,
-        reason: null,
-        appleLookupDeferred: null,
-        appleLookupErrorCode: null,
-        notificationType,
-        notificationSubtype: subtype,
-        originalTransactionId,
-        transactionId: transactionInfo.transactionId || null,
-        webOrderLineItemId: transactionInfo.webOrderLineItemId || null,
-        autoRenewStatus:
-          renewalInfo.autoRenewStatus != null
-            ? String(renewalInfo.autoRenewStatus) === "1"
+      const ownerUserId = sub.userId;
+      const sourceId = sourceMatch?.sourceId || buildSubscriptionSourceId({
+        source: "app_store",
+        details: sourceMatch?.data || sub.data || {
+          originalTransactionId,
+          transactionId: transactionInfo.transactionId || null,
+        },
+        productId: sub.data?.planId || null,
+        verificationData: signedTransactionInfo || originalTransactionId,
+      });
+
+      await persistSubscriptionSourceAndAggregate({
+        adminInstance,
+        userId: ownerUserId,
+        sourceId,
+        data: {
+          ...(sourceMatch?.data || {}),
+          platform: "app_store",
+          planId: sub.data?.planId || null,
+          status,
+          reason: null,
+          appleLookupDeferred: null,
+          appleLookupErrorCode: null,
+          notificationType,
+          notificationSubtype: subtype,
+          originalTransactionId,
+          transactionId: transactionInfo.transactionId || null,
+          webOrderLineItemId: transactionInfo.webOrderLineItemId || null,
+          autoRenewStatus:
+            renewalInfo.autoRenewStatus != null
+              ? String(renewalInfo.autoRenewStatus) === "1"
+              : null,
+          expiryDateMs: expiryDateMs || null,
+          revocationDateMs: transactionInfo.revocationDate
+            ? new Date(transactionInfo.revocationDate).getTime()
             : null,
-        expiryDateMs: expiryDateMs || null,
-        revocationDateMs: transactionInfo.revocationDate
-          ? new Date(transactionInfo.revocationDate).getTime()
-          : null,
+        },
+        functionsInstance,
       });
 
-      console.log("[easySubs][appleWebhook] updated subscription", {
+      logInfo(functionsInstance, "[easySubs][appleWebhook] updated subscription", {
         requestId,
-        userId: sub.userId,
+        userId: ownerUserId,
+        sourceId,
         status,
         originalTransactionId,
         transactionId: transactionInfo.transactionId || null,
         expiryDateMs: expiryDateMs || null,
       });
 
-      console.log("[easySubs][appleWebhook] responding 200", { requestId });
+      logInfo(functionsInstance, "[easySubs][appleWebhook] responding 200", { requestId });
       res.status(200).send("OK");
     } catch (error) {
-      console.error("[easySubs][appleWebhook] unhandled error", {
+      logError(functionsInstance, "[easySubs][appleWebhook] unhandled error", {
         requestId,
         message: error?.message || String(error),
         stack: error?.stack || null,
@@ -801,7 +1718,7 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
         const notificationType = subscriptionNotification.notificationType;
         const subscriptionId = subscriptionNotification.subscriptionId;
 
-        console.log("[easySubs][googlePubSubHandler] incoming", {
+        logInfo(functionsInstance, "[easySubs][googlePubSubHandler] incoming", {
           packageName: raw.packageName,
           notificationType,
           subscriptionId,
@@ -809,18 +1726,7 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
         });
 
         if (!purchaseToken) {
-          console.warn("[easySubs][googlePubSubHandler] missing purchaseToken, skipping");
-          return;
-        }
-
-        const sub = await findSubscriptionByField(
-          adminInstance,
-          "purchaseToken",
-          purchaseToken,
-        );
-
-        if (!sub) {
-          console.warn("[easySubs][googlePubSubHandler] subscription not found for purchaseToken");
+          logWarn(functionsInstance, "[easySubs][googlePubSubHandler] missing purchaseToken, skipping");
           return;
         }
 
@@ -833,48 +1739,99 @@ function createEasySubsFunctions(adminInstance, functionsInstance) {
           throw new Error("Missing GOOGLE_PLAY_PACKAGE_NAME environment variable");
         }
 
-        const auth = new google.auth.GoogleAuth({
-          scopes: ["https://www.googleapis.com/auth/androidpublisher"],
-        });
-        const authClient = await auth.getClient();
-        const androidpublisher = google.androidpublisher({ version: "v3", auth: authClient });
-
-        const response = await androidpublisher.purchases.subscriptionsv2.get({
+        const payload = await fetchGoogleSubscription({
+          verificationData: purchaseToken,
           packageName,
-          token: purchaseToken,
+          productId: subscriptionId || null,
+          functionsInstance,
+          logContext: {
+            verificationMode: "rtdn",
+            notificationType,
+          },
         });
 
-        const payload = response.data || {};
         const lineItems = Array.isArray(payload.lineItems) ? payload.lineItems : [];
-        const line = lineItems[0] || {};
+        const line = (subscriptionId
+          ? lineItems.find((item) => item?.productId === subscriptionId)
+          : null) || lineItems[0] || {};
         const status = mapGoogleSubscriptionState(payload.subscriptionState);
+        const linkedPurchaseToken = payload.linkedPurchaseToken || null;
 
-        await upsertSubscription(adminInstance, sub.userId, {
-          planId: subscriptionId || sub.data?.planId || null,
-          platform: "google_play",
-          status,
-          reason: null,
-          appleLookupDeferred: null,
-          appleLookupErrorCode: null,
+        const sourceMatch = await findSubscriptionSourceByGoogleTokens(adminInstance, {
           purchaseToken,
-          latestOrderId: line.latestSuccessfulOrderId || null,
-          expiryDateMs: line.expiryTime ? new Date(line.expiryTime).getTime() : null,
-          rawSubscriptionState: payload.subscriptionState || null,
-          rtdnNotificationType: notificationType,
+          linkedPurchaseToken,
+          functionsInstance,
+        });
+        const sub = sourceMatch || await findSubscriptionByGoogleTokens(adminInstance, {
+          purchaseToken,
+          linkedPurchaseToken,
+          functionsInstance,
         });
 
-        console.log("[easySubs][googlePubSubHandler] updated subscription", {
-          userId: sub.userId,
+        if (!sub) {
+          logWarn(functionsInstance, "[easySubs][googlePubSubHandler] subscription not found for purchase token chain", {
+            purchaseToken,
+            linkedPurchaseToken,
+            subscriptionId,
+          });
+          return;
+        }
+
+        const ownerUserId = sub.userId;
+        const sourceId = sourceMatch?.sourceId || buildSubscriptionSourceId({
+          source: "google_play",
+          details: sourceMatch?.data || sub.data || {
+            purchaseToken,
+            linkedPurchaseToken,
+          },
+          productId: subscriptionId || sub.data?.planId || null,
+          verificationData: purchaseToken,
+        });
+
+        await persistSubscriptionSourceAndAggregate({
+          adminInstance,
+          userId: ownerUserId,
+          sourceId,
+          data: {
+            ...(sourceMatch?.data || {}),
+            planId: subscriptionId || sub.data?.planId || null,
+            platform: "google_play",
+            status,
+            reason: null,
+            appleLookupDeferred: null,
+            appleLookupErrorCode: null,
+            purchaseToken,
+            linkedPurchaseToken,
+            latestOrderId: line.latestSuccessfulOrderId || null,
+            expiryDateMs: line.expiryTime ? new Date(line.expiryTime).getTime() : null,
+            rawSubscriptionState: payload.subscriptionState || null,
+            rtdnNotificationType: notificationType,
+            acknowledged:
+              payload.acknowledgementState === "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+            acknowledgementRequired:
+              isEntitledStatus(status) &&
+              payload.acknowledgementState !== "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+          },
+          functionsInstance,
+        });
+
+        logInfo(functionsInstance, "[easySubs][googlePubSubHandler] updated subscription", {
+          userId: ownerUserId,
+          sourceId,
           status,
           notificationType,
         });
       } catch (error) {
-          console.error("Google RTDN Error:", error);
+          logError(functionsInstance, "[easySubs][googlePubSubHandler] unhandled error", {
+            message: error?.message || String(error),
+            stack: error?.stack || null,
+          });
       }
   });
 
   return {
     verifyPurchase,
+    refreshPurchaseStatus,
     appleWebhook,
     googlePubSubHandler
   };

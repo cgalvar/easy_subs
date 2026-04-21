@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../models/google_play_subscription_change.dart';
 import '../models/subscription_plan.dart';
 import '../models/purchase_result.dart';
 
@@ -14,10 +15,19 @@ abstract class SubscriptionRepository {
   Future<List<SubscriptionPlan>> getAvailablePlans(Set<String> productIds);
 
   /// Starts the purchase process for a plan.
-  Future<void> buyPlan(SubscriptionPlan plan);
+  ///
+  /// On Android, [googlePlayChange] can be supplied to upgrade or downgrade
+  /// an existing subscription using a specific replacement/proration mode.
+  Future<void> buyPlan(SubscriptionPlan plan, {GooglePlaySubscriptionChange? googlePlayChange});
 
   /// Restores previous purchases (vital for accounts reconnecting or changing devices)
   Future<void> restorePurchases();
+
+  /// Reloads the latest verification token for a product from the store when supported.
+  ///
+  /// On Google Play this queries current purchases directly, which is useful when
+  /// the app needs a fresh purchase token for long-lived subscriptions.
+  Future<PurchaseResult?> refreshPurchaseVerificationData(String productId);
 
   /// Completes (acknowledges) the transaction. Mandatory to call this
   /// after your backend successfully validates the `verificationToken`.

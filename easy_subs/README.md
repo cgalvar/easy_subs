@@ -66,11 +66,47 @@ await iapService.buyPlan(selectedPlan);
 // The result will be pushed automatically to your `purchaseStream` listener above.
 ```
 
+### 3.b Change a Google Play Subscription with Proration
+If the user is already subscribed on Android, fetch the current purchase first and pass it into `googlePlayChange`.
+
+```dart
+final currentPurchase = await iapService.refreshPurchaseVerificationData(
+  'com.myapp.premium.monthly',
+);
+
+if (currentPurchase != null) {
+  await iapService.buyPlan(
+    yearlyPlan,
+    googlePlayChange: GooglePlaySubscriptionChange(
+      oldPurchase: currentPurchase,
+      replacementMode: GooglePlayReplacementMode.withTimeProration,
+    ),
+  );
+}
+```
+
 ### 4. Restore Purchases
 Trigger this when the user taps "Restore Purchases" to retrieve previous active subscriptions.
 
 ```dart
 await iapService.restorePurchases();
+```
+
+### 4.b Refresh a Long-Lived Google Play Purchase Token
+For Google Play subscriptions, you can fetch the latest verification token directly from Billing before revalidating with your backend.
+
+```dart
+final refreshedPurchase = await iapService.refreshPurchaseVerificationData(
+  'com.myapp.premium.monthly',
+);
+
+if (refreshedPurchase?.verificationToken != null) {
+  await firebaseSubs.refreshPurchaseStatus(
+    source: 'google_play',
+    productId: refreshedPurchase!.productId,
+    verificationData: refreshedPurchase.verificationToken,
+  );
+}
 ```
 
 ## Architecture Philosophy (Zero Trust) 🔐
@@ -108,6 +144,14 @@ bool isValid = await firebaseSubs.verifyPurchase(
   source: 'app_store', 
   productId: purchase.productId, 
   verificationData: purchase.verificationToken,
+);
+
+// To refresh an existing subscription state, optionally supplying a newer
+// Google Play purchase token returned by refreshPurchaseVerificationData():
+await firebaseSubs.refreshPurchaseStatus(
+  source: 'google_play',
+  productId: 'com.myapp.premium.monthly',
+  verificationData: refreshedPurchase?.verificationToken,
 );
 
 // To read the active plan directly from Firestore (subscriptions collection):

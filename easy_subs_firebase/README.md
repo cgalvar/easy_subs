@@ -6,3 +6,8 @@ A companion extension for `easy_subs` that adds Firebase Firestore and Cloud Fun
 - Zero Trust Purchase Verification via Cloud Functions
 - Local Firestore reads to get the active subscription plan
 - Includes a standalone deployable node.js backend
+
+## Setup Guides
+
+- [Google Play Setup](backend/GOOGLE_PLAY_SETUP.md)
+- [Backend Overview](backend/README.md)
